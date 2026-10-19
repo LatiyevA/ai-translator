@@ -1,4 +1,4 @@
-# AI Translator from Chinese to Russian
+# AI Translator
 
 ## What this project about
 
@@ -18,4 +18,4 @@ This is AI Translator that translates text from Chinese to Russian. This project
 
 ### Implementation Details
 
-Text will be divided into chapters or into equal parts of a certain size. At first cheap model will be used for creating and editing a glossary of the translation. Then human can check and edit the glossary. After that, the main translation will be done using a more expensive model with the help of the glossary. The translation will be done in parts, every chapter or section will be translated in a distinct thread with glossary and global prompt, then all parts will be combined into one file. Might consider simple sqllite database for storing the part translated parts before assembling them in the final output file. The final output will be a .txt file with the translated text.
+At first, the .txt file with Chinese text will be read. Chinese text will be divided into equal parts using tiktoken and langchain-text-splitters packages, those part then will be sent to the OpenAI model for getting individual glossary in json format for each part that will be stored in a SQLite database. After all parts are processed, all version of glossary will be merged into one final glossary that will be used for the final translation of the whole text. The translation also will be done in parts, with each part being translated in a distinct thread with the help of the glossary and a global prompt. Results of the fished translations will be stored in SQLite until all parts are translated. The final translation will be saved in a .txt file.
