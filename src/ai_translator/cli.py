@@ -1,24 +1,43 @@
 import argparse
 import json
-import os
+import re
 import sqlite3
 import sys
 import zipfile
-from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import closing
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from lxml import etree
 
 from .config import DEFAULT_MODELS, load_config
-from .formats import read_book
-from .pipeline import Requests, batches, extract, load_glossary, open_state, translate
+from .console import configure_output
+from .formats import chapter_revision, read_book
+from .paths import default_output
+from .pipeline import (
+    BudgetExceeded, CacheMiss, Requests, batches, default_state_path, expand_glossary, extract, load_glossary, open_state,
+    read_request_budget, state_for_reading, translate,
+)
+from .provider import AuthenticationError, ProviderError
+from .publication import check_publication, output_path, recover_outputs, validate_job_paths, write_outputs
+
+
+def _chapter_reference(value: str) -> tuple[int, str | None]:
+    number, separator, revision = value.partition("@")
+    try:
+        chapter = int(number)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Укажите номер главы или идентификатор из оглавления.") from None
+    if separator and not re.fullmatch(r"[0-9a-f]{16}", revision):
+        raise argparse.ArgumentTypeError("Скопируйте идентификатор главы целиком из оглавления.")
+    return chapter, revision if separator else None
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Литературный перевод книг с китайского на русский.")
     commands = parser.add_subparsers(dest="command", required=True)
+    doctor = commands.add_parser("doctor", help="Проверить вход у провайдера без перевода.")
+    doctor.add_argument("--provider", choices=DEFAULT_MODELS, default="codex")
+    doctor.add_argument("--json-events", action="store_true", help="Вывод событий в формате JSON Lines.")
     for command, help_text in (
         ("translate", "Перевести TXT, EPUB или FB2."),
         ("sample", "Перевести начало книги и сохранить двуязычный TXT для оценки."),
@@ -26,94 +45,241 @@ def _parser() -> argparse.ArgumentParser:
         ("inspect", "Показать число блоков и пакетов без обращения к модели."),
     ):
         sub = commands.add_parser(command, help=help_text)
+        sub.add_argument("--json-events", action="store_true", help="Вывод событий в формате JSON Lines.")
         sub.add_argument("input", type=Path, help="Исходный TXT, EPUB или FB2.")
         sub.add_argument("--config", type=Path, help="Файл параметров TOML.")
         sub.add_argument("--encoding", help="Явная кодировка входного TXT.")
         sub.add_argument("--glossary", type=Path, help="Входной JSON с утверждёнными соответствиями.")
+        sub.add_argument("--state", type=Path, help="Путь к SQLite-кешу ответов.")
         if command != "glossary":
             sub.add_argument("--no-auto-glossary", action="store_true", help="Пропустить сбор терминов.")
             sub.add_argument("--edit", action="store_true", help="Включить литературную редактуру.")
+            review = sub.add_mutually_exclusive_group()
+            review.add_argument("--review-edits", action="store_true",
+                                help="Сверить черновик и редактуру с оригиналом. Требуется --edit.")
+            review.add_argument("--repair-review", action="store_true",
+                                help="Сверить все пакеты и разрешить исправление общих ошибок. Требуется --edit.")
+        sub.add_argument("--provider", choices=DEFAULT_MODELS, help="Переопределить провайдера.")
+        if command in ("sample", "inspect"):
+            sub.add_argument("--chapter", type=_chapter_reference, metavar="N[@РЕВИЗИЯ]",
+                             help="Выбрать главу по идентификатору из inspect или по её текущему номеру.")
+            sub.add_argument("--chapter-revision", help=argparse.SUPPRESS)
+            sub.add_argument("--batches", type=int, help="Сколько пакетов взять для пробы по пакетам.")
+            sub.add_argument("--start-batch", type=int, help="Номер первого пакета пробы по пакетам.")
         if command == "inspect":
+            sub.add_argument("--for", dest="operation", choices=("translate", "sample", "glossary"),
+                             default="translate", help="Действие для расчёта запросов.")
+            sub.add_argument("--list-chapters", action="store_true", help="Показать только список глав без чтения кеша.")
             continue
         sub.add_argument("-o", "--output", type=Path, help="Путь к выходному файлу.")
-        sub.add_argument("--state", type=Path, help="Путь к SQLite-кешу ответов.")
-        sub.add_argument("--provider", choices=DEFAULT_MODELS, help="Переопределить провайдера.")
         sub.add_argument("--max-calls", type=int, help="Максимум новых запросов за запуск.")
-        sub.add_argument("--force", action="store_true", help="Заменить существующий выходной файл.")
+        total = sub.add_mutually_exclusive_group()
+        total.add_argument("--max-total-calls", type=int, help="Сохранить общий лимит в SQLite. -1 снимает лимит.")
+        total.add_argument("--tighten-total-calls", type=int,
+                           help="Ограничить общий расход и сохранить более строгий потолок, если он уже есть.")
+        override = sub.add_mutually_exclusive_group()
+        override.add_argument("--force", action="store_true", help="Разрешить замену всех выходных файлов.")
+        override.add_argument("--replace-existing", type=Path, action="append", default=[],
+                              help="Разрешить замену только указанного выходного файла.")
         if command in ("translate", "sample"):
             sub.add_argument("--save-glossary", type=Path, help="Сохранить итоговый глоссарий в JSON.")
         if command == "sample":
-            sub.add_argument("--batches", type=int, default=1, help="Сколько первых пакетов перевести.")
+            sub.add_argument("--sample-pairs", action="store_true",
+                             help="Включить пары оригинала и перевода в поток --json-events.")
+            sub.add_argument("--sample-versions", action="store_true",
+                             help="Добавить в пары черновик, редактуру и выбор сверки. Требуются --sample-pairs и --edit.")
     return parser
 
 
-def _same_path(first: Path, second: Path) -> bool:
-    return first.resolve() == second.resolve() or (
-        first.exists() and second.exists() and first.samefile(second)
-    )
-
-
-def _write_outputs(outputs: list[tuple[Path, Callable[[Path], None]]], force: bool) -> None:
-    with ExitStack() as cleanup:
-        staged = []
-        for path, writer in outputs:
-            with NamedTemporaryFile(dir=path.parent, prefix=".ai-translator-", delete=False) as stream:
-                temporary = Path(stream.name)
-            cleanup.callback(temporary.unlink, missing_ok=True)
-            writer(temporary)
-            staged.append((temporary, path))
-
-        linked = []
-        try:
-            for temporary, path in staged:
-                if force:
-                    temporary.replace(path)
-                else:
-                    os.link(temporary, path)
-                    linked.append((temporary, path))
-        except OSError:
-            for temporary, path in linked:
-                if path.exists() and path.samefile(temporary):
-                    path.unlink()
-            raise
-
-
-def _validate_paths(reads: list[Path], outputs: list[Path], force: bool) -> None:
-    for index, path in enumerate(outputs):
-        if any(_same_path(path, other) for other in reads + outputs[:index]):
-            raise ValueError(f"Пути исходника, кеша и выходных файлов должны различаться: {path}")
-        if not path.parent.is_dir() or path.is_dir():
-            raise ValueError(f"Нужен путь к файлу в существующей папке: {path}")
-        if not force and (path.exists() or path.is_symlink()):
-            raise ValueError(f"Файл уже существует: {path}. Для замены укажите --force.")
-
-
 def _run(args: argparse.Namespace) -> None:
-    settings = load_config(args.config, getattr(args, "provider", None))
-    book = read_book(args.input, args.encoding)
+    def report(event: str, message: str, *, error_stream: bool = False, **fields) -> None:
+        if args.json_events:
+            print(json.dumps({"event": event, "message": message, **fields}, ensure_ascii=False), flush=True)
+        else:
+            print(message, file=sys.stderr if error_stream else sys.stdout, flush=True)
+
+    if args.command == "doctor":
+        from .pipeline import provider_backend
+        if provider_backend(args.provider, 20).check() is False:
+            raise ProviderError("Antigravity не подтвердил вход при проверке без запроса к модели.")
+        message = ("Переменная OPENAI_API_KEY задана. Проверка не обращалась к API."
+                   if args.provider == "openai-api" else f"Вход через {args.provider} подтверждён.")
+        report("authentication_ok", message)
+        return
+
+    sample_pairs = getattr(args, "sample_pairs", False)
+    sample_versions = getattr(args, "sample_versions", False)
+    if sample_pairs and not args.json_events:
+        raise ValueError("--sample-pairs применяется вместе с --json-events.")
+    if sample_versions and (not sample_pairs or not args.edit):
+        raise ValueError("--sample-versions применяется вместе с --sample-pairs и --edit.")
+    operation = args.operation if args.command == "inspect" else args.command
+    preview = operation == "sample"
+    list_chapters = getattr(args, "list_chapters", False)
+    batch_range = getattr(args, "start_batch", None) is not None or getattr(args, "batches", None) is not None
+    if batch_range and (not preview or list_chapters):
+        raise ValueError("--start-batch и --batches применяются к sample и inspect --for sample без --list-chapters.")
+    chapter_number, reference_revision = getattr(args, "chapter", None) or (None, None)
+    expected_revision = getattr(args, "chapter_revision", None)
+    if list_chapters and chapter_number is not None:
+        raise ValueError("--list-chapters нельзя сочетать с --chapter.")
+    if chapter_number is not None:
+        if not preview:
+            raise ValueError("--chapter применяется к sample и inspect --for sample.")
+        if batch_range:
+            raise ValueError("--chapter нельзя сочетать с --start-batch или --batches.")
+    if expected_revision is not None and chapter_number is None:
+        raise ValueError("--chapter-revision применяется вместе с --chapter.")
+    if expected_revision is not None and reference_revision is not None:
+        raise ValueError("Укажите ревизию главы один раз.")
+    with_chapters = list_chapters or chapter_number is not None
+    revision = chapter_revision(args.input, args.encoding) if with_chapters else None
+    if (expected_revision is not None and expected_revision != revision
+            or reference_revision is not None and reference_revision != revision[:16]):
+        raise ValueError("Выбор главы устарел. Загрузите оглавление заново и выберите главу.")
+    if not list_chapters:
+        settings = load_config(args.config, getattr(args, "provider", None))
+    book = read_book(args.input, args.encoding, with_chapters=with_chapters)
+    if revision is not None and revision != chapter_revision(args.input, args.encoding):
+        raise ValueError("Книга изменилась при чтении оглавления. Повторите выбор главы.")
+    if list_chapters:
+        catalog = [{"number": number, "reference": f"{number}@{revision[:16]}",
+                    "title": chapter.title, "units": chapter.unit_count}
+                   for number, chapter in enumerate(book.chapters, 1)]
+        message = ("\n".join(f"{entry['reference']} · {entry['title']} · блоков: {entry['units']}" for entry in catalog)
+                   or "Главы по заголовкам не найдены. Можно выбрать пробу по пакетам.")
+        report("chapters", message, chapters=catalog, revision=revision)
+        return
+    review_edits = getattr(args, "review_edits", False)
+    repair_review = getattr(args, "repair_review", False)
+    if (review_edits or repair_review) and (operation == "glossary" or not args.edit):
+        flag = "--repair-review" if repair_review else "--review-edits"
+        raise ValueError(f"{flag} применяется к переводу или пробе вместе с --edit.")
+    chapter = None
+    if chapter_number is not None:
+        if not 1 <= chapter_number <= len(book.chapters):
+            raise ValueError(f"--chapter вне диапазона. Глав с китайским текстом: {len(book.chapters)}.")
+        chapter = book.chapters[chapter_number - 1]
     glossary = load_glossary(args.glossary)
-    groups = list(batches(book, settings.batch_chars, tuple(glossary)))
+    spellings = expand_glossary(glossary)
+    groups = list(batches(book, settings.batch_chars, tuple(spellings), chapter=chapter))
+    state = args.state or default_state_path(args.input)
     if args.command == "inspect":
-        units = sum(map(len, book.sections))
-        count = len(groups)
-        glossary_calls = 0 if args.no_auto_glossary else count
-        edit_calls = count if args.edit else 0
-        print(f"Блоков с китайским текстом: {units}. Пакетов: {count}.")
-        print(f"Запросов без кеша и повторов: {glossary_calls + count + edit_calls} "
-              f"(глоссарий: {glossary_calls}, перевод: {count}, редактура: {edit_calls}).")
+        state = state_for_reading(state)
+        if state.exists() and not state.is_file():
+            raise ValueError(f"Для кеша нужен путь к файлу SQLite. {state}")
+    offset = args.start_batch - 1 if preview and args.start_batch is not None else 0
+    limit = (len(groups) if chapter is not None else
+             args.batches if preview and args.batches is not None else 1)
+    if preview and limit < 1:
+        raise ValueError("--batches должен быть положительным.")
+    if preview and (offset < 0 or offset >= max(1, len(groups))):
+        raise ValueError(f"--start-batch вне диапазона. Пакетов: {len(groups)}.")
+
+    def process_book(requests: Requests, progress, groups_ready=None):
+        work_groups = groups
+        terms = glossary
+        lookup = spellings
+        sample = [] if preview else None
+        if operation == "glossary" or not args.no_auto_glossary:
+            glossary_groups = work_groups[offset:offset + limit] if preview else work_groups
+            terms = extract(requests, glossary_groups, terms, progress)
+            if terms.keys() != glossary.keys():
+                lookup = expand_glossary(terms)
+                if operation == "translate":
+                    work_groups = list(batches(book, settings.batch_chars, tuple(lookup)))
+        if groups_ready is not None:
+            groups_ready(len(work_groups))
+        if operation != "glossary":
+            translate(requests, work_groups, lookup, args.edit, progress,
+                      sample=sample, sample_versions=sample_versions, limit=limit if preview else None, start=offset,
+                      review_edits=review_edits, repair_review=repair_review)
+        return terms, sample
+
+    if args.command == "inspect":
+        units = chapter.unit_count if chapter is not None else sum(map(len, book.sections))
+        initial_count = len(groups[offset:offset + limit]) if preview else len(groups)
+        glossary_calls = initial_count if operation == "glossary" or not args.no_auto_glossary else 0
+        group_label = "Пакетов до автоглоссария" if operation == "translate" and glossary_calls else "Пакетов"
+        report("inspection", f"Блоков с китайским текстом: {units}. {group_label}: {len(groups)}.",
+               units=units, batches=len(groups))
+        if preview and initial_count:
+            start, stop = offset + 1, offset + initial_count
+            first, last = groups[offset][0], groups[stop - 1][-1]
+            opening = first.unit.visible_text(first.text).strip()[:100]
+            ending = last.unit.visible_text(last.text).strip()[-100:]
+            label = f"Глава {chapter_number} · {chapter.title}\n" if chapter is not None else ""
+            report("sample_range", f"{label}Пакеты {start}–{stop}\nПервый блок · {opening}\nПоследний блок · {ending}",
+                   first_batch=start, last_batch=stop, opening=opening, closing=ending)
+        models = {stage: {"model": model.name, "reasoning": model.reasoning}
+                  for stage, model in settings.models.items()}
+        choices = ", ".join(f"{stage}={model.name}/{model.reasoning or 'auto'}"
+                            for stage, model in settings.models.items())
+        report("settings", f"{settings.provider} · {choices}", provider=settings.provider, models=models)
+        cached_count = cached_hits = 0
+        resolved_groups = None
+
+        def remember_groups(amount):
+            nonlocal resolved_groups
+            resolved_groups = amount
+
+        request_budget = None
+        first_missing = ("glossary" if glossary_calls else "translate") if groups else None
+        if state.is_file():
+            with closing(sqlite3.connect(state.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                db.execute("BEGIN")
+                table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'").fetchone()
+                cached_count = db.execute("SELECT COUNT(*) FROM responses").fetchone()[0] if table else 0
+                request_budget = read_request_budget(db)
+                if cached_count:
+                    probe = Requests(db, settings, inspect_cache=True)
+                    first_missing = None
+                    try:
+                        process_book(probe, lambda *_: None, remember_groups)
+                    except CacheMiss as miss:
+                        first_missing = miss.stage
+                    cached_hits = probe.hits
+        translated = 0 if operation == "glossary" else initial_count
+        if operation == "translate" and resolved_groups is not None:
+            translated = resolved_groups
+        edit_calls = translated if args.edit else 0
+        review_calls = edit_calls if review_edits or repair_review else 0
+        provisional = operation == "translate" and bool(glossary_calls) and resolved_groups is None
+        review_detail = ""
+        if repair_review:
+            review_detail = f", сверка с исправлениями: {review_calls}"
+        elif review_edits:
+            review_detail = f", сверка: до {review_calls}"
+        estimate = "Предварительный план без кеша и повторов" if provisional else "Запросов без кеша и повторов"
+        maximum = "до " if review_edits and not provisional else ""
+        detail = " Разбиение может измениться после глоссария." if provisional else ""
+        report("plan", f"{estimate}: {maximum}{glossary_calls + translated + edit_calls + review_calls} "
+               f"(глоссарий: {glossary_calls}, перевод: {translated}, редактура: {edit_calls}{review_detail}).{detail}",
+               glossary=glossary_calls, translate=translated, edit=edit_calls, review=review_calls,
+               provisional=provisional)
+        report("cache", f"Ответов в базе кеша: {cached_count}.", cached_answers=cached_count)
+        if first_missing is None:
+            report("cache_replay", f"Кеш покрывает весь выбранный запуск. Будет использовано ответов: {cached_hits}.",
+                   reusable_answers=cached_hits, complete=True, first_missing_stage=None)
+        else:
+            stage_labels = {"glossary": "глоссарий", "translate": "перевод", "edit": "редактура", "review": "сверка"}
+            report("cache_replay", f"До первого нового запроса будет использовано ответов из кеша: "
+                   f"{cached_hits}. Следующий этап · {stage_labels[first_missing]}.",
+                   reusable_answers=cached_hits, complete=False, first_missing_stage=first_missing)
+        if request_budget is not None:
+            attempts, ceiling = request_budget
+            report("request_budget", f"Всего учтённых запросов: {attempts}. Общий лимит: "
+                   f"{ceiling if ceiling is not None else 'не задан'}.", attempts=attempts, ceiling=ceiling)
         return
 
     if args.max_calls is not None and args.max_calls < 0:
         raise ValueError("--max-calls должен быть неотрицательным.")
-    preview = args.command == "sample"
-    if preview and args.batches < 1:
-        raise ValueError("--batches должен быть положительным.")
-    state = args.state or args.input.with_name(f".{args.input.name}.ai-translator.sqlite3")
+    if args.max_total_calls is not None and not -1 <= args.max_total_calls <= 2**63 - 1:
+        raise ValueError("--max-total-calls должен быть неотрицательным целым числом или -1.")
+    if args.tighten_total_calls is not None and not 0 <= args.tighten_total_calls <= 2**63 - 1:
+        raise ValueError("--tighten-total-calls должен быть неотрицательным целым числом.")
     collect = args.command == "glossary"
-    default_suffix = ".glossary.json" if collect else f".ru{args.input.suffix.lower()}"
-    if preview:
-        default_suffix = ".sample.ru.txt"
-    output = args.output or args.input.with_name(args.input.stem + default_suffix)
+    output = args.output or default_output(args.input, args.command, chapter=chapter_number)
     glossary_output = output if collect else getattr(args, "save_glossary", None)
     if preview and output.suffix.lower() != ".txt":
         raise ValueError("Выходной файл пробы должен иметь формат TXT.")
@@ -123,40 +289,60 @@ def _run(args: argparse.Namespace) -> None:
         raise ValueError("Выходной глоссарий должен иметь расширение .json.")
 
     reads = [path for path in (args.input, args.config, args.glossary) if path is not None]
-    if any(_same_path(state, path) for path in reads):
-        raise ValueError("Кеш должен храниться отдельно от исходных файлов.")
     outputs = [output]
     if not collect and glossary_output is not None:
         outputs.append(glossary_output)
-    _validate_paths(reads + [state], outputs, args.force)
+    validate_job_paths(reads, state, outputs, True)
+    replacements = {output_path(path) for path in args.replace_existing}
+    if replacements - {output_path(path) for path in outputs}:
+        raise ValueError("--replace-existing должен указывать один из выходных файлов.")
+    overwrite = True if args.force else replacements
+    recover_outputs(outputs)
+    validate_job_paths(reads, state, outputs, overwrite)
+    check_publication(outputs, overwrite)
 
     def progress(stage: str, current: int, total: int) -> None:
-        print(f"{stage} {current}/{total}", file=sys.stderr, flush=True)
+        report("progress", f"{stage} {current}/{total}", error_stream=True,
+               stage=stage, current=current, total=total)
 
     with open_state(state) as db:
-        requests = Requests(db, settings, args.max_calls)
-        sample = [] if preview else None
+        update_limit = args.max_total_calls is not None or args.tighten_total_calls is not None
+        if update_limit and args.json_events:
+            report("request_budget_update", "Запись общего лимита…")
+        requests = Requests(db, settings, args.max_calls, max_total_calls=args.max_total_calls,
+                            tighten_total_calls=args.tighten_total_calls)
+        initial_attempts = requests.total_calls
+        if args.tighten_total_calls is not None:
+            budget_message = "Применён наиболее строгий общий лимит."
+        elif update_limit:
+            budget_message = "Изменение общего лимита сохранено."
+        else:
+            budget_message = f"Ранее учтённых запросов · {initial_attempts}."
+        report("request_budget", budget_message, error_stream=True,
+               attempts=initial_attempts, ceiling=requests.total_limit, changed=update_limit, phase="start")
         try:
-            if collect or not args.no_auto_glossary:
-                glossary_groups = groups[:args.batches] if preview else groups
-                expanded = extract(requests, glossary_groups, glossary, progress)
-                if expanded.keys() != glossary.keys() and not collect and not preview:
-                    groups = list(batches(book, settings.batch_chars, tuple(expanded)))
-                glossary = expanded
-            if not collect:
-                translate(requests, groups, glossary, args.edit, progress,
-                          sample=sample, limit=args.batches if preview else None)
+            glossary, sample = process_book(requests, progress)
         finally:
-            print(f"Запросов к модели: {requests.calls}. Ответов из кеша: {requests.hits}.", file=sys.stderr)
+            try:
+                budget = read_request_budget(db)
+            except sqlite3.Error:
+                budget = None
+            attempts, ceiling = budget if budget is not None else (requests.total_calls, requests.total_limit)
+            calls = attempts - initial_attempts if budget is not None else requests.calls
+            report("requests", f"Запросов к модели: {calls}. Ответов из кеша: {requests.hits}.",
+                   error_stream=True, calls=calls, cache_hits=requests.hits)
+            label = f"Запросов в базе · {attempts}" + (f" / {ceiling}" if ceiling is not None else "")
+            report("request_budget", label, error_stream=True, attempts=attempts, ceiling=ceiling, phase="final")
             if requests.backend is not None:
                 usage = requests.backend.usage
                 if usage.input or usage.output:
-                    print(f"Токенов по данным провайдера: {usage.input} на входе "
-                          f"({usage.cached_input} из кеша провайдера), {usage.output} на выходе.",
-                          file=sys.stderr)
+                    report("usage", f"Токенов по данным провайдера: {usage.input} на входе "
+                           f"({usage.cached_input} из кеша провайдера), {usage.output} на выходе.",
+                           error_stream=True, input_tokens=usage.input, output_tokens=usage.output,
+                           cached_input_tokens=usage.cached_input)
         writers = []
         if sample is not None:
-            comparison = "\n\n".join(f"{original}\n{translated}" for original, translated in sample)
+            comparison = "\n\n".join(f"{pair.original}\n{pair.translation}" for pair in sample)
             writers.append((output, lambda path: path.write_text(
                 comparison + ("\n" if comparison else ""), encoding="utf-8"
             )))
@@ -165,22 +351,41 @@ def _run(args: argparse.Namespace) -> None:
         if glossary_output is not None:
             glossary_json = json.dumps(glossary, ensure_ascii=False, indent=2) + "\n"
             writers.append((glossary_output, lambda path: path.write_text(glossary_json, encoding="utf-8")))
-        _write_outputs(writers, args.force)
+        write_outputs(writers, overwrite)
         if not groups:
-            print("Китайский текст для обработки не найден.", file=sys.stderr)
+            report("notice", "Китайский текст для обработки не найден.", error_stream=True)
+        if sample_pairs:
+            for pair in sample:
+                versions = ({"draft": pair.draft, "edited": pair.edited, "review_choice": pair.review_choice}
+                            if sample_versions else {})
+                report("sample_pair", "", original=pair.original, translation=pair.translation, **versions)
         for path in outputs:
-            print(path)
+            report("output", str(path), path=str(path.resolve()))
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_output()
     args = _parser().parse_args(argv)
+
+    def failure(event: str, message: str) -> None:
+        if args.json_events:
+            print(json.dumps({"event": event, "message": message}, ensure_ascii=False), flush=True)
+        else:
+            print(message, file=sys.stderr)
+
     try:
         _run(args)
     except KeyboardInterrupt:
-        print("Прервано. Повторите команду для продолжения из SQLite-кеша.", file=sys.stderr)
+        failure("cancelled", "Прервано. Повторите команду для продолжения из SQLite-кеша.")
         return 130
+    except BudgetExceeded as exc:
+        failure("budget", str(exc))
+        return 3
+    except AuthenticationError as exc:
+        failure("authentication", str(exc))
+        return 4
     except (ValueError, OSError, LookupError, etree.XMLSyntaxError, sqlite3.Error, zipfile.BadZipFile) as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
+        failure("error", f"Ошибка: {exc}")
         return 1
     return 0
 

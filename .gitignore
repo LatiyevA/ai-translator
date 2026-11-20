@@ -15,3 +15,13 @@ example_chinese_text.txt
 
 # Local translation cache
 *.ai-translator.sqlite3*
+.ai-translator-cache/
+
+# Translation output locks and recovery journals
+.*.ai-translator-publish.*
+.ai-translator-publication/
+.ai-translator-transaction-*.json
+.ai-translator-original-*
+.ai-translator-restore-*
+
+.ai-translator-stage-*

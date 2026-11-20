@@ -7,8 +7,14 @@ authors = [{ name = "latieyva", email = "abilailat@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = ["lxml>=5.4,<7"]
 
+[project.optional-dependencies]
+desktop = ["PySide6-Essentials>=6.8,<7"]
+
 [project.scripts]
 ai-translator = "ai_translator.cli:main"
+
+[project.gui-scripts]
+ai-translator-desktop = "ai_translator.desktop:main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
