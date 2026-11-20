@@ -19,7 +19,7 @@ from lxml import etree
 from ai_translator import publication
 from ai_translator.cli import main as cli
 from ai_translator.config import Model, load_config
-from ai_translator.formats import ANCHOR, Book, _xml, _xml_units, read_book
+from ai_translator.formats import ANCHOR, Book, _xml, _xml_units, read_book, read_chapters, read_txt_document, txt_number_gaps
 from ai_translator.numerals import equivalent_numeric
 from ai_translator.paths import CACHE_DIRECTORY, PUBLICATION_DIRECTORY, default_output, path_too_long
 from ai_translator.pipeline import (
@@ -133,6 +133,192 @@ class TranslatorTests(TestCase):
             status = cli(list(map(str, args)))
         self.assertEqual(status, expected, stderr.getvalue() or stdout.getvalue())
         return stdout.getvalue(), stderr.getvalue()
+
+    def test_txt_manual_map_decodes_crlf_and_non_han_boundaries_and_checks_revision(self):
+        self.source.write_bytes("序言\r\n\r\nPart One\r\n春雨来了。\r\n\r\nPart Two\r\n她回家了。\r\n".encode("gb18030"))
+        self.assertEqual(txt_number_gaps({1: "第一章 早晨", 3: "第三章 下午", 5: "第二卷 晚上"}), [(3, 1, 3)])
+        document = read_txt_document(self.source, "gb18030")
+        chapter_map = self.directory / "book.chapters.json"
+        chapter_map.write_text(document.map_content({3: "Одинаковое название", 5: "Одинаковое название"}),
+                               encoding="utf-8")
+        options = ("--encoding", "gb18030", "--txt-map", chapter_map)
+        raw, _ = self.invoke("inspect", "--list-chapters", "--json-events", *options, self.source)
+        entries = json.loads(raw)["chapters"]
+        self.assertEqual([(e["title"], e["units"]) for e in entries],
+                         [("Начало книги", 1), ("Одинаковое название", 1), ("Одинаковое название", 1)])
+        self.assertEqual(read_chapters(self.source, "gb18030", chapter_map),
+                         read_book(self.source, "gb18030", with_chapters=True, txt_map=chapter_map).chapters)
+        # Boundary inspection does not access the cache, including a path that is a directory.
+        raw, _ = self.invoke("inspect", "--for", "sample", "--sample-boundaries", "--state", self.directory,
+                             "--chapter", entries[2]["reference"], "--json-events", *options, self.source)
+        events = {event["event"]: event for event in map(json.loads, raw.splitlines())}
+        self.assertEqual(events["sample_range"]["opening"], "她回家了。")
+        self.assertEqual(events["sample_range"]["closing"], "她回家了。")
+        self.assertNotIn("plan", events)
+        chapter_map.write_text(document.map_content({3: "Оставшаяся глава"}), encoding="utf-8")
+        _, error = self.invoke("inspect", "--for", "sample", "--chapter", entries[2]["reference"],
+                               *options, self.source, expected=1)
+        self.assertIn("Выбор главы устарел", error)
+        self.source.write_bytes(self.source.read_bytes() + "她说话了。\r\n".encode("gb18030"))
+        _, error = self.invoke("inspect", "--list-chapters", *options, self.source, expected=1)
+        self.assertIn("Карта TXT устарела", error)
+        self.assertEqual(FakeCodex.calls, [])
+
+    def test_chapter_union_skips_gaps_deduplicates_fb2_children_and_resumes(self):
+        source = self.directory / "union.fb2"
+        source.write_text("""<FictionBook><body>
+          <section><title><p>甲章</p></title><p>她开门。</p>
+             <section><title><p>子章</p></title><p>春雨来了。</p></section>
+          </section>
+          <section><title><p>乙章</p></title><p>她走路。</p></section>
+          <section><title><p>丙章</p></title><p>她回家。</p></section>
+        </body></FictionBook>""", encoding="utf-8")
+        raw, _ = self.invoke("inspect", "--list-chapters", "--json-events", source)
+        refs = [entry["reference"] for entry in json.loads(raw)["chapters"]]
+        choices = ("--chapter", refs[3], "--chapter", refs[1], "--chapter", refs[0], "--chapter", refs[1])
+        output = default_output(source, "sample", chapter=(1, 2, 4))
+        raw, _ = self.invoke("inspect", "--for", "sample", "--json-events", "--no-auto-glossary", *choices, source)
+        events = {event["event"]: event for event in map(json.loads, raw.splitlines())}
+        self.assertEqual(events["inspection"]["units"], 6)
+        self.assertEqual(events["plan"]["translate"], 2)
+        args = ("sample", "--no-auto-glossary", "--json-events", "--sample-pairs", *choices, source)
+        self.invoke(*args, "--max-total-calls", "2", "--max-calls", "1", expected=3)
+        self.assertFalse(output.exists())
+        raw, _ = self.invoke(*args, "--max-calls", "1")
+        events = list(map(json.loads, raw.splitlines()))
+        self.assertEqual([e["original"] for e in events if e["event"] == "sample_pair"],
+                         ["甲章", "她开门。", "子章", "春雨来了。", "丙章", "她回家。"])
+        self.assertEqual(len(FakeCodex.calls), 2)
+        first, second = [payload for _, payload in FakeCodex.calls]
+        self.assertEqual((first["following"], second["preceding"], second["following"]), ("", "", ""))
+        published = output.read_bytes()
+        self.invoke(*args, "--force", "--max-calls", "0")
+        self.assertEqual(len(FakeCodex.calls), 2)
+        self.assertEqual(output.read_bytes(), published)
+
+    def test_chapter_file_selects_sparse_ranges_and_reuses_legacy_sample_cache(self):
+        self.source.write_text("第一章 山路\n她走路。\n第二章 石门\n她开门。\n第三章 春雨\n她回家。\n",
+                               encoding="utf-8")
+        raw, _ = self.invoke("inspect", "--list-chapters", "--json-events", self.source)
+        catalog = json.loads(raw)
+        selection = self.directory / "выбор глав.json"
+        selection.write_text(json.dumps({"version": 1, "revision": catalog["revision"], "chapters": [3, 1, 3]}),
+                             encoding="utf-8")
+        raw, _ = self.invoke("inspect", "--for", "sample", "--sample-boundaries", "--json-events",
+                             "--state", self.directory, "--chapter-file", selection, self.source)
+        bounds = {event["event"]: event for event in map(json.loads, raw.splitlines())}
+        self.assertEqual(bounds["inspection"]["chapters"], [1, 3])
+        self.assertEqual(bounds["sample_range"]["opening"], "第一章 山路")
+        self.assertEqual(bounds["sample_range"]["closing"], "她回家。")
+        self.assertNotIn("plan", bounds)
+        self.assertEqual(FakeCodex.calls, [])
+
+        args = ("sample", "--no-auto-glossary", "--sample-pairs", "--json-events", self.source)
+        refs = [entry["reference"] for entry in catalog["chapters"]]
+        self.invoke(*args, "--chapter", refs[0], "--chapter", refs[2])
+        output = default_output(self.source, "sample", chapter=(1, 3))
+        published = output.read_bytes()
+        raw, _ = self.invoke(*args, "--chapter-file", selection, "--max-calls", "0", "--force")
+        events = list(map(json.loads, raw.splitlines()))
+        self.assertEqual([event["original"] for event in events if event["event"] == "sample_pair"],
+                         ["第一章 山路", "她走路。", "第三章 春雨", "她回家。"])
+        self.assertEqual(next(event["calls"] for event in events if event["event"] == "requests"), 0)
+        self.assertEqual(output.read_bytes(), published)
+        self.assertEqual(len(FakeCodex.calls), 2)
+
+        self.source.write_text("序言\n" + self.source.read_text(encoding="utf-8"), encoding="utf-8")
+        raw, _ = self.invoke(*args, "--chapter-file", selection, "--force", expected=1)
+        self.assertIn("Выбор главы устарел", json.loads(raw)["message"])
+        self.assertEqual(output.read_bytes(), published)
+        self.assertEqual(len(FakeCodex.calls), 2)
+
+    def test_chapter_file_validates_schema_and_incompatible_options(self):
+        self.source.write_text("第一章 山路\n她走路。\n", encoding="utf-8")
+        raw, _ = self.invoke("inspect", "--list-chapters", "--json-events", self.source)
+        revision = json.loads(raw)["revision"]
+        selection = self.directory / "selection.json"
+        base_args = ("inspect", "--for", "sample", "--chapter-file", selection, self.source)
+        valid = {"version": 1, "revision": revision, "chapters": [1]}
+        cases = [
+            ("{", "Не удалось прочитать JSON"),
+            ("[]", "Версия файла"),
+            (json.dumps({**valid, "version": True}), "Версия файла"),
+            (json.dumps({**valid, "version": 2}), "Версия файла"),
+            (json.dumps({**valid, "revision": revision[:16]}), "полная ревизия"),
+            (json.dumps({**valid, "revision": 1}), "полная ревизия"),
+            (json.dumps({**valid, "chapters": []}), "положительных целых"),
+            (json.dumps({**valid, "chapters": [True]}), "положительных целых"),
+            (json.dumps({**valid, "chapters": ["1"]}), "положительных целых"),
+            (json.dumps({**valid, "chapters": [1.0]}), "положительных целых"),
+            (json.dumps({**valid, "chapters": [0]}), "положительных целых"),
+            (json.dumps({**valid, "chapters": [2]}), "вне диапазона"),
+        ]
+        for data, message in cases:
+            with self.subTest(data=data):
+                selection.write_text(data, encoding="utf-8")
+                _, error = self.invoke(*base_args, expected=1)
+                self.assertIn(message, error)
+        selection.write_text(json.dumps(valid), encoding="utf-8")
+        for extra in (("--batches", 1), ("--start-batch", 1), ("--list-chapters",),
+                      ("--chapter-revision", revision), ("--for", "translate")):
+            with self.subTest(extra=extra):
+                _, error = self.invoke(*base_args, *extra, expected=1)
+                self.assertIn("--chapter", error)
+        with self.assertRaises(SystemExit) as error, redirect_stderr(io.StringIO()) as stderr:
+            cli(list(map(str, (*base_args, "--chapter", 1))))
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--chapter-file", stderr.getvalue())
+        self.assertFalse(default_state_path(self.source).exists())
+        self.assertEqual(FakeCodex.calls, [])
+
+    def test_proofreading_publishes_addresses_and_replays_corrections_with_no_calls(self):
+        source = self.directory / "review.fb2"
+        source.write_text("""<FictionBook>
+          <description><title-info><book-title>雨夜</book-title></title-info></description>
+          <body><section><p>她开门。</p></section></body>
+          <body name="notes"><section><p>这是脚注。</p></section></body>
+        </FictionBook>""", encoding="utf-8")
+        output = default_output(source, "translate")
+        complete = FakeCodex.complete
+        calls = []
+
+        def reject_once(backend, model, instructions, data, schema):
+            calls.append(instructions)
+            return {"translations": []} if len(calls) == 1 else complete(backend, model, instructions, data, schema)
+
+        args = ("translate", "--proofreading", "--json-events", "--edit", "--review-edits",
+                "--no-auto-glossary", source)
+        with patch.object(FakeCodex, "complete", reject_once):
+            raw, _ = self.invoke(*args, "--max-calls", "1", expected=3)
+            self.assertNotIn('"event": "proofreading', raw)
+            self.assertFalse(output.exists())
+            raw, _ = self.invoke(*args)
+        events = list(map(json.loads, raw.splitlines()))
+        names = [row["event"] for row in events]
+        self.assertLess(names.index("output"), names.index("proofreading"))
+        report = [event for event in events if event["event"].startswith("proofreading")]
+        self.assertEqual((report[0]["parts"], report[0]["checked"], report[0]["review_mode"]), (3, 3, "changes"))
+        self.assertEqual([(row["section"], row["block"], row["part"], row["status"]) for row in report[1:]],
+                         [(1, 1, 1, "rejected_then_accepted"), (1, 1, 1, "draft"),
+                          (2, 1, 1, "edited"), (3, 1, 1, "edited")])
+        published = output.read_bytes()
+        replay, _ = self.invoke(*args, "--force", "--max-calls", "0")
+        replay = list(map(json.loads, replay.splitlines()))
+        self.assertEqual([event for event in replay if event["event"].startswith("proofreading")], report)
+        self.assertEqual(next(e for e in replay if e["event"] == "requests")["calls"], 0)
+        self.assertEqual(output.read_bytes(), published)
+        without_report = self.directory / "without-report.fb2"
+        self.invoke("translate", "--edit", "--review-edits", "--no-auto-glossary", "--max-calls", "0",
+                    "-o", without_report, source)
+        self.assertEqual(without_report.read_bytes(), published)
+        with patch("ai_translator.cli.write_outputs", side_effect=OSError("test publication failed")):
+            failed, _ = self.invoke(*args, "--force", "--max-calls", "0", expected=1)
+        self.assertNotIn('"event": "proofreading', failed)
+        self.assertEqual(output.read_bytes(), published)
+        raw, _ = self.invoke("translate", "--proofreading", "--json-events", "--no-auto-glossary",
+                             "--max-calls", "0", "--force", source)
+        summary = next(e for e in map(json.loads, raw.splitlines()) if e["event"] == "proofreading")
+        self.assertEqual((summary["parts"], summary["checked"], summary["review_mode"]), (3, 0, "off"))
 
     def test_entry_points_emit_utf8_even_when_the_pipe_encoding_is_cp1252(self):
         self.source.write_text("雨夜。\n", encoding="utf-8")
@@ -260,6 +446,12 @@ class TranslatorTests(TestCase):
         with patch("ai_translator.pipeline.Codex", side_effect=AssertionError("Unexpected request")):
             self.invoke("sample", *args, "--max-calls", "0", "-o", replay)
         self.assertEqual(replay.read_bytes(), first)
+        multi, _ = self.invoke("sample", source, "--chapter", entries[1]["reference"], "--chapter", entries[0]["reference"],
+                               "--no-auto-glossary", "--json-events", "--sample-pairs")
+        originals = [item["original"] for item in map(json.loads, multi.splitlines()) if item["event"] == "sample_pair"]
+        self.assertEqual(originals, ["第一章", "哈利来了。", *pairs])
+        self.assertNotIn("第三章", originals)
+        self.assertTrue(default_output(source, "sample", chapter=(1, 2)).is_file())
 
     def test_epub_chapter_anchor_at_end_of_xhtml_owns_the_continuation(self):
         base = self.directory / "base.epub"

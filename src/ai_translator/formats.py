@@ -1,5 +1,6 @@
 import codecs
 import hashlib
+import json
 import os
 import posixpath
 import re
@@ -17,6 +18,8 @@ from urllib.parse import unquote, urlsplit
 
 from lxml import etree
 
+from .numerals import _integer
+
 HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U000323af]")
 ANCHOR = re.compile(r"⟦A[0-9]{1,18}⟧")
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
@@ -27,7 +30,7 @@ DC = "{http://purl.org/dc/elements/1.1/}"
 SVG = "{http://www.w3.org/2000/svg}"
 SVG_TEXT_POSITION = frozenset(("x", "y", "dx", "dy", "rotate"))
 TXT_HEADING = re.compile(
-    r"第[〇零一二三四五六七八九十百千万两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９]+[章节節回卷部篇]"
+    r"第([〇零一二三四五六七八九十百千万两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９]+)([章节節回卷部篇])"
     r"(?=$|[\s:：、.．—(（\[【-])"
 )
 FB2_AUXILIARY_BODIES = frozenset(("notes", "footnotes", "endnotes", "comments"))
@@ -88,6 +91,19 @@ class Chapter:
         return sum(end - start for _, start, end in self.spans)
 
 
+def chapter_selection(chapters: Iterable[Chapter]) -> Chapter:
+    chapters = tuple(chapters)
+    if len(chapters) == 1:
+        return chapters[0]
+    merged: list[tuple[int, int, int]] = []
+    for section, start, stop in sorted(span for chapter in chapters for span in chapter.spans):
+        if merged and merged[-1][0] == section and start <= merged[-1][2]:
+            merged[-1] = (section, merged[-1][1], max(stop, merged[-1][2]))
+        else:
+            merged.append((section, start, stop))
+    return Chapter("Выбранные главы", tuple(merged))
+
+
 @dataclass
 class Book:
     sections: list[list[Unit]]
@@ -96,11 +112,13 @@ class Book:
     chapters: tuple[Chapter, ...] = ()
 
 
-def chapter_revision(path: Path, encoding: str | None) -> str:
+def chapter_revision(path: Path, encoding: str | None, txt_map: Path | None = None) -> str:
     stat = path.stat()
     version = FORMAT_CATALOG_VERSIONS.get(path.suffix.lower(), CHAPTER_CATALOG_VERSION)
     identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, encoding or "",
                 version)
+    if txt_map is not None:
+        identity += (chapter_revision(txt_map, None),)
     return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
 
 
@@ -329,41 +347,137 @@ def _read_limited(path: Path, limit: int) -> bytes:
     return data
 
 
-def _txt(path: Path, encoding: str | None, *, with_chapters: bool) -> Book:
+@dataclass
+class TxtDocument:
+    lines: list[str]
+    encoding: str
+    digest: str | None
+
+    def map_content(self, anchors: dict[int, str]) -> str:
+        return json.dumps({
+            "version": 1, "source_sha256": self.digest, "encoding": self.encoding,
+            "anchors": [{"line": line, "title": title} for line, title in sorted(anchors.items())],
+        }, ensure_ascii=False, indent=2) + "\n"
+
+    def load_map(self, path: Path) -> dict[int, str]:
+        data = json.loads(_read_limited(path, MAX_TXT_BYTES).decode("utf-8-sig"))
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+            raise ValueError("Версия карты TXT не поддерживается.")
+        if data.get("source_sha256") != self.digest or data.get("encoding") != self.encoding:
+            raise ValueError("Карта TXT устарела: изменился исходник или кодировка.")
+        anchors = {}
+        entries = data.get("anchors")
+        if not isinstance(entries, list):
+            raise ValueError("В карте TXT ожидается список anchors.")
+        for entry in entries:
+            line = entry.get("line") if isinstance(entry, dict) else None
+            title = entry.get("title") if isinstance(entry, dict) else None
+            if (type(line) is not int or not 1 <= line <= len(self.lines) or line in anchors
+                    or not isinstance(title, str) or not title.strip() or title.splitlines() != [title]
+                    or "\x00" in title or len(title) > 240):
+                raise ValueError(f"Некорректная или повторная граница карты TXT: строка {line}.")
+            anchors[line] = title.strip()
+        return anchors
+
+
+def read_txt_document(path: Path, encoding: str | None = None, *, fingerprint: bool = True) -> TxtDocument:
+    if path.suffix.lower() != ".txt" or not path.is_file():
+        raise ValueError("Для карты нужен обычный файл TXT.")
     data = _read_limited(path, MAX_TXT_BYTES)
     if encoding:
+        encoding = codecs.lookup(encoding).name
         content = data.decode(encoding)
-        if codecs.lookup(encoding).name in {"utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"}:
+        if encoding in {"utf-8", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"}:
             content = content.removeprefix("\ufeff")
-    elif data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
-        content = data.decode("utf-32")
-    elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        content = data.decode("utf-16")
     else:
+        if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+            encoding = "utf-32"
+        elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            encoding = "utf-16"
+        else:
+            encoding = "utf-8-sig"
         try:
-            content = data.decode("utf-8-sig")
+            content = data.decode(encoding)
         except UnicodeDecodeError:
-            content = data.decode("gb18030")
-    lines = content.splitlines(keepends=True)
+            if encoding != "utf-8-sig":
+                raise
+            encoding = "gb18030"
+            content = data.decode(encoding)
+    return TxtDocument(content.splitlines(keepends=True), encoding, hashlib.sha256(data).hexdigest() if fingerprint else None)
+
+
+def txt_auto_title(line: str) -> str | None:
+    core = line.strip()
+    return core if len(core) <= 120 and TXT_HEADING.match(core) else None
+
+
+def txt_number_gaps(anchors: dict[int, str]) -> list[tuple[int, int, int]]:
+    """Report jumps between consecutive recognizable headings of the same kind."""
+    gaps = []
+    prior_kind, prior_number = None, 0
+    for line, title in sorted(anchors.items()):
+        match = TXT_HEADING.match(title)
+        if match is None:
+            prior_kind = None
+            continue
+        digits, kind = match.groups()
+        number = _integer(digits.translate(str.maketrans("兩貳參陸", "两贰叁陆")))
+        kind = kind.replace("節", "节")
+        if kind == prior_kind and number > prior_number + 1:
+            gaps.append((line, prior_number, number))
+        prior_kind, prior_number = kind, number
+    return gaps
+
+
+def _txt_catalog(count: int, starts: dict[tuple[int, int], str], manual: bool) -> tuple[Chapter, ...]:
+    if manual and count and not starts:
+        return (Chapter("Начало книги", ((0, 0, count),)),)
+    return _chapter_catalog([(0, 0, count)], starts)
+
+
+def read_chapters(path: Path, encoding: str | None, txt_map: Path | None = None) -> tuple[Chapter, ...]:
+    if path.suffix.lower() != ".txt":
+        return read_book(path, encoding, with_chapters=True, txt_map=txt_map).chapters
+    document = read_txt_document(path, encoding, fingerprint=txt_map is not None)
+    anchors = document.load_map(txt_map) if txt_map is not None else None
+    starts = {}
+    count = 0
+    for number, line in enumerate(document.lines, 1):
+        has_han = HAN.search(line)
+        title = anchors.get(number) if anchors is not None else txt_auto_title(line) if has_han else None
+        if title is not None:
+            starts[0, count] = title
+        if has_han:
+            count += 1
+    return _txt_catalog(count, starts, anchors is not None)
+
+
+def _txt(path: Path, encoding: str | None, *, with_chapters: bool, txt_map: Path | None) -> Book:
+    document = read_txt_document(path, encoding, fingerprint=txt_map is not None)
+    lines = document.lines
+    anchors = document.load_map(txt_map) if txt_map is not None else None
     units = []
     starts = {}
     for index, line in enumerate(lines):
-        if HAN.search(line):
-            core = line.strip()
-            if with_chapters and len(core) <= 120 and TXT_HEADING.match(core):
-                starts[0, len(units)] = core
+        has_han = HAN.search(line)
+        if with_chapters:
+            title = anchors.get(index + 1) if anchors is not None else txt_auto_title(line) if has_han else None
+            if title is not None:
+                starts[0, len(units)] = title
+        if has_han:
             indent = line[:len(line) - len(line.lstrip())]
             ending = line[len(line.rstrip()):]
 
             def replace(text: str, index=index, indent=indent, ending=ending) -> None:
                 lines[index] = indent + text + ending
 
-            units.append(Unit(core, replace))
+            units.append(Unit(line.strip(), replace))
 
     def write(output: Path) -> None:
         output.write_bytes("".join(lines).encode("utf-8"))
 
-    return Book([units], write, chapters=_chapter_catalog([(0, 0, len(units))], starts))
+    chapters = _txt_catalog(len(units), starts, anchors is not None) if with_chapters else ()
+    return Book([units], write, chapters=chapters)
 
 
 def _fb2_note_targets(root: etree._Element) -> set[str]:
@@ -753,12 +867,15 @@ def _epub(path: Path, *, with_chapters: bool) -> Book:
     return Book(sections, write, frozenset(narrative_sections), _chapter_catalog(chapter_regions, chapter_starts))
 
 
-def read_book(path: Path, encoding: str | None = None, *, with_chapters: bool = False) -> Book:
+def read_book(path: Path, encoding: str | None = None, *, with_chapters: bool = False,
+              txt_map: Path | None = None) -> Book:
     suffix = path.suffix.lower()
     if suffix in (".txt", ".fb2", ".epub") and not path.is_file():
         raise ValueError(f"Нужен обычный файл книги: {path}")
     if suffix == ".txt":
-        return _txt(path, encoding, with_chapters=with_chapters)
+        return _txt(path, encoding, with_chapters=with_chapters, txt_map=txt_map)
+    if txt_map is not None:
+        raise ValueError("--txt-map применяется только к TXT.")
     if encoding:
         raise ValueError("--encoding применяется только к TXT.")
     if suffix == ".fb2":

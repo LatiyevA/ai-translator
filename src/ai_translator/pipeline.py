@@ -304,6 +304,7 @@ class Requests:
     def __init__(
         self, connection: sqlite3.Connection, settings: Settings, max_calls: int | None = None,
         *, max_total_calls: int | None = None, tighten_total_calls: int | None = None, inspect_cache: bool = False,
+        report_rejections: bool = False,
     ):
         self.db = connection
         self.settings = settings
@@ -312,6 +313,8 @@ class Requests:
         self.hits = 0
         self.max_calls = max_calls
         self.inspect_cache = inspect_cache
+        self.report_rejections = report_rejections
+        self.last_rejection = None
         if inspect_cache:
             return
         self.db.execute(
@@ -319,6 +322,9 @@ class Requests:
         )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS corrections (key TEXT PRIMARY KEY, message TEXT NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS response_rejections (key TEXT PRIMARY KEY, reason TEXT NOT NULL)"
         )
         with self.db:
             self.db.execute(
@@ -339,6 +345,7 @@ class Requests:
             ).fetchone()
 
     def run(self, stage: str, prompt: str, payload: dict, schema: dict, validate: Callable) -> object:
+        self.last_rejection = None
         model = self.settings.models[stage]
         instructions = f"{GUIDANCE}\n\n{prompt}"
         data = _json(payload)
@@ -356,8 +363,12 @@ class Requests:
                     raise CacheMiss(stage) from None
                 with self.db:
                     self.db.execute("DELETE FROM responses WHERE key = ?", (key,))
+                    self.db.execute("DELETE FROM response_rejections WHERE key = ?", (key,))
             else:
                 self.hits += 1
+                if self.report_rejections:
+                    record = self.db.execute("SELECT reason FROM response_rejections WHERE key = ?", (key,)).fetchone()
+                    self.last_rejection = record[0] if record else None
                 return value
 
         if self.inspect_cache:
@@ -406,6 +417,10 @@ class Requests:
                     )
                     self.db.execute("DELETE FROM corrections WHERE key = ?", (key,))
                     if cursor.rowcount:
+                        if correction is not None:
+                            self.last_rejection = correction[:500]
+                            self.db.execute("INSERT OR REPLACE INTO response_rejections VALUES (?, ?)",
+                                            (key, self.last_rejection))
                         return value
                     stored = self.db.execute("SELECT body FROM responses WHERE key = ?", (key,)).fetchone()
                     return validate(json.loads(stored[0]))
@@ -415,7 +430,7 @@ class Requests:
 LabelBounds = tuple[str | None, str | None]
 
 
-@dataclass
+@dataclass(slots=True)
 class Piece:
     unit: Unit
     text: str
@@ -425,6 +440,7 @@ class Piece:
     context_section: int
     link_labels: tuple[LabelBounds, ...] = ()
     positioned_labels: tuple[LabelBounds, ...] = ()
+    address: tuple[int, int, int] | None = None
 
 
 Group = list[Piece]
@@ -507,13 +523,39 @@ def _split_labels(source: str, edges: list[int], markers: dict[str, tuple[int, i
     return fragments
 
 
-def batches(book: Book, limit: int, glossary: tuple[str, ...] = (), *, chapter: Chapter | None = None) -> Iterator[Group]:
+def batches(book: Book, limit: int, glossary: tuple[str, ...] = (), *, chapter: Chapter | None = None,
+            separate_gaps: bool = False, addresses: bool = False) -> Iterator[Group]:
     group: Group = []
     size = 0
-    sections = (enumerate(book.sections) if chapter is None else
-                ((section, book.sections[section][start:end]) for section, start, end in chapter.spans))
-    for section, units in sections:
-        for unit in units:
+    spans = (chapter.spans if chapter is not None else
+             ((i, 0, len(units)) for i, units in enumerate(book.sections)))
+    prior_section = prior_end = None
+    context_sections = {}
+    next_context = -2
+    for section, start, end in spans:
+        if separate_gaps and prior_section is not None:
+            if section == prior_section:
+                gap = start != prior_end
+            else:
+                gap = (prior_end != len(book.sections[prior_section]) or start != 0
+                       or any(book.sections[i] for i in range(prior_section + 1, section)))
+            if gap:
+                if group:
+                    yield group
+                    group = []
+                    size = 0
+                context_sections.clear()
+        else:
+            gap = False
+        context_section = -1 if section in book.narrative_sections else section
+        if separate_gaps:
+            if gap or (next_context < -2 and context_section not in context_sections):
+                context_sections[context_section] = next_context
+                next_context -= 1
+            context_section = context_sections.setdefault(context_section, context_section)
+        prior_section, prior_end = section, end
+        for block in range(start, end):
+            unit = book.sections[section][block]
             parts = list(_split(unit.source, limit, glossary, unit.line_breaks, unit.markup_markers))
             links = positioned = [()] * len(parts)
             if unit.link_labels or unit.positioned_labels:
@@ -526,9 +568,9 @@ def batches(book: Book, limit: int, glossary: tuple[str, ...] = (), *, chapter: 
                     yield group
                     group = []
                     size = 0
-                context_section = -1 if section in book.narrative_sections else section
+                address = (section + 1, block + 1, index + 1) if addresses else None
                 group.append(Piece(unit, part, index == 0, index == len(parts) - 1, section, context_section,
-                                   tuple(link_labels), tuple(positioned_labels)))
+                                   tuple(link_labels), tuple(positioned_labels), address))
                 size += len(part)
     if group:
         yield group
@@ -660,7 +702,28 @@ def _translations(
     return [result[index] for index in range(1, len(group) + 1)]
 
 
-def extract(requests: Requests, groups: list[Group], glossary: Glossary, progress: Progress) -> Glossary:
+class Proofreading:
+    def __init__(self, emit: Callable[[dict], None]):
+        self.emit = emit
+        self.parts = 0
+        self.checked = 0
+        self.findings = 0
+
+    def decision(self, piece: Piece, stage: str, status: str, reason: str) -> None:
+        section, block, part = piece.address
+        self.findings += 1
+        excerpt = " ".join(piece.unit.visible_text(piece.text).split())[:100]
+        self.emit({"section": section, "block": block, "part": part, "original_excerpt": excerpt,
+                   "stage": stage, "status": status, "reason": reason})
+
+    def rejection(self, requests: Requests, group: Group, stage: str) -> None:
+        if requests.last_rejection is not None:
+            self.decision(group[0], stage, "rejected_then_accepted",
+                          f"Пакет начинается здесь. Первый ответ отклонён: {requests.last_rejection}")
+
+
+def extract(requests: Requests, groups: list[Group], glossary: Glossary, progress: Progress,
+            *, proofreading: Proofreading | None = None) -> Glossary:
     glossary = glossary.copy()
     known = expand_glossary(glossary)
     for index, group in enumerate(groups, 1):
@@ -672,6 +735,8 @@ def extract(requests: Requests, groups: list[Group], glossary: Glossary, progres
             "blocks": _blocks(group),
             "glossary": relevant,
         }, GLOSSARY_SCHEMA, lambda response: _entries(response, source, relevant))
+        if proofreading is not None:
+            proofreading.rejection(requests, group, "glossary")
         glossary.update(entries)
         known.update(entries)
     return glossary
@@ -745,7 +810,7 @@ def translate(
     requests: Requests, groups: list[Group], glossary: Glossary, edit: bool, progress: Progress,
     *, sample: list[SamplePair] | None = None, sample_versions: bool = False,
     limit: int | None = None, start: int = 0,
-    review_edits: bool = False, repair_review: bool = False,
+    review_edits: bool = False, repair_review: bool = False, proofreading: Proofreading | None = None,
 ) -> None:
     draft_tails: dict[int, str] = {}
     edit_tails: dict[int, str] = {}
@@ -806,10 +871,13 @@ def translate(
             return _translations(response, group, context["glossary"], strict)
 
         draft_text = requests.run("translate", TRANSLATE_PROMPT + instructions, context, TRANSLATION_SCHEMA, validate)
+        if proofreading is not None:
+            proofreading.rejection(requests, group, "translate")
         _remember_context(draft_tails, group, draft_text)
         result = draft_text
         edited_text = None
         choices = {}
+        checked = set()
         if edit:
             progress("Редактура", index - start, total)
             draft = [{"id": key, "text": text} for key, text in enumerate(draft_text, 1)]
@@ -817,10 +885,14 @@ def translate(
             edited_text = requests.run("edit", EDIT_PROMPT + instructions, {
                 **context, "draft": draft, "preceding": preceding_edit,
             }, TRANSLATION_SCHEMA, validate)
+            if proofreading is not None:
+                proofreading.rejection(requests, group, "edit")
             result = edited_text
             if review_edits or repair_review:
                 changed = {key for key, (before, after) in enumerate(zip(draft_text, edited_text), 1) if before != after}
                 if repair_review or changed:
+                    if proofreading is not None:
+                        checked = set(range(1, len(group) + 1)) if repair_review else changed
                     progress("Сверка", index - start, total)
                     review_context = {
                         **context, "draft": draft, "preceding": preceding_edit,
@@ -838,7 +910,21 @@ def translate(
                         choices = {key: "draft" if key in restored else "edited" for key in changed}
                         result = [draft_text[key - 1] if key in restored else text
                                   for key, text in enumerate(edited_text, 1)]
+                    if proofreading is not None:
+                        proofreading.rejection(requests, group, "review")
             _remember_context(edit_tails, group, result)
+        if proofreading is not None:
+            proofreading.parts += len(group)
+            proofreading.checked += len(checked)
+            for key, piece in enumerate(group, 1):
+                choice = choices.get(key)
+                edited_changed = edited_text is not None and draft_text[key - 1] != edited_text[key - 1]
+                if choice is not None and (choice == "repaired" or edited_changed):
+                    reason = {"draft": "Сверка выбрала черновик.", "edited": "Сверка выбрала редактуру.",
+                              "repaired": "Сверка внесла исправление."}[choice]
+                    proofreading.decision(piece, "review", choice, reason)
+                elif edited_changed:
+                    proofreading.decision(piece, "edit", "changed_unreviewed", "Редактура изменила текст.")
         for key, (piece, text) in enumerate(zip(group, result), 1):
             if sample is not None:
                 visible_text = piece.unit.visible_text

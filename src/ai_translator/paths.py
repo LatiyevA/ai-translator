@@ -22,10 +22,17 @@ def path_too_long(path: Path) -> bool:
     return False
 
 
-def default_output(source: Path, operation: str, *, chapter: int | None = None) -> Path:
+def default_output(source: Path, operation: str, *, chapter: int | tuple[int, ...] | None = None) -> Path:
+    selection = ""
+    if isinstance(chapter, tuple):
+        numbers = ",".join(map(str, chapter))
+        digest = hashlib.sha256(numbers.encode("ascii")).hexdigest()[:16]
+        selection = f".chapters-{len(chapter)}-{digest}"
+    elif chapter is not None:
+        selection = f".chapter-{chapter}"
     suffix = {
         "translate": f".ru{source.suffix.lower()}",
-        "sample": f".chapter-{chapter}.sample.ru.txt" if chapter is not None else ".sample.ru.txt",
+        "sample": f"{selection}.sample.ru.txt",
         "glossary": ".glossary.json",
     }[operation]
     destination = source.with_name(source.stem + suffix)

@@ -15,9 +15,9 @@ from ai_translator.pipeline import Requests, default_state_path, load_glossary, 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from ai_translator.desktop import QApplication, GlossaryDialog, QSettings, Window, _confirm_replace, main
-    from PySide6.QtCore import QCoreApplication, QEvent, Qt
+    from PySide6.QtCore import QCoreApplication, QEvent, QTimer, Qt
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    from PySide6.QtWidgets import QFileDialog, QMessageBox, QPlainTextEdit
 except ImportError:
     QApplication = None
 
@@ -89,14 +89,18 @@ if "changed" in payload:
     fields = schema["properties"]["choices"]["items"]["properties"]
     if "text" in fields:
         response = {"choices": [
-            {"id": block["id"], "version": "repaired", "text": "Она осторожно приоткрыла дверь."}
+            {"id": block["id"], "version": "repaired", "text":
+             "Она заговорила с сестрой Гермионы." if "妙丽" in block["text"] else "Она осторожно приоткрыла дверь."}
             for block in payload["blocks"]
         ]}
     else:
         response = {"choices": [{"id": key, "version": "draft"} for key in payload["changed"]]}
 else:
     text = "Она бесшумно отворила дверь." if "draft" in payload else "Она тихонько отворила дверь."
-    response = {"translations": [{"id": block["id"], "text": text} for block in payload["blocks"]]}
+    response = {"translations": [
+        {"id": block["id"], "text": text + (" Вместе с сестрой Гермионы." if "妙丽" in block["text"] else "")}
+        for block in payload["blocks"]
+    ]}
 print(json.dumps({"type": "turn.started"}))
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(response)}}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 7}}))
@@ -118,16 +122,407 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 20, "outpu
         self.window.show()
 
     def _close_window(self):
+        if self.window.process is not None:
+            self.window.cancel()
+            self._until(lambda: self.window.process is None)
         self.window.close()
         self.window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.window = None
 
     def _until(self, condition):
-        deadline = monotonic() + 8
+        deadline = monotonic() + 20
         while not condition() and monotonic() < deadline:
             QTest.qWait(20)
         self.assertTrue(condition(), self.window.log.toPlainText())
+
+    def test_plan_summary_distinguishes_read_only_partial_and_complete_cache(self):
+        window = self.window
+        window.edit.setChecked(True)
+        window.review_edits.setChecked(True)
+        window.budget.setValue(0)
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIs(window.results.currentWidget(), window.plan_summary)
+        self.assertIn("Доступно новых запросов · 0", window.plan_summary.toPlainText())
+        self.assertIn("сверка изменённых пакетов", window.plan_summary.toPlainText())
+        state = default_state_path(self.source)
+        self.assertFalse(state.exists())
+
+        window.budget.setValue(1)
+        self.assertIn("Оценка устарела", window.plan_summary.toPlainText())
+        window.run.click()
+        self._until(lambda: window.process is None)
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("ответов из кеша: 1", window.plan_summary.toPlainText())
+        self.assertIn("Запросов к модели: 1", window.run_summary.toPlainText())
+        self.assertIn("20 на входе", window.run_summary.toPlainText())
+        with open_state(state) as db:
+            self.assertEqual(read_request_budget(db), (1, None))
+
+        window.budget.setValue(2)
+        window.run.click()
+        self._until(lambda: window.process is None)
+        window.budget.setValue(0)
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("Кеш покрывает весь выбранный запуск", window.plan_summary.toPlainText())
+        with open_state(state) as db:
+            db.execute("UPDATE request_budget SET ceiling = 3")
+            db.commit()
+        self._until(lambda: "Оценка устарела" in window.plan_summary.toPlainText())
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("В базе · 3 / 3", window.plan_summary.toPlainText())
+        profile = self.directory / "new.toml"
+        profile.write_text('style = "Простой стиль"\n', encoding="utf-8")
+        window._load_profile(profile)
+        self.assertIn("Оценка устарела", window.plan_summary.toPlainText())
+
+    def test_filtered_catalog_keyboard_boundaries_and_multi_selection_restore(self):
+        window = self.window
+        self.source.write_text("".join(f"第{i}章 {'石门' if i in {1, 1000} else '雨'}\n春雨来了。\n"
+                                       for i in range(1, 1001)), encoding="utf-8")
+        window.resize(730, 590)
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.load_chapters.click()
+        self._until(lambda: window.process is None)
+        window.chapter_search.setText("石门")
+        self.assertIn("2 из 1000", window.chapter_count.text())
+        QTest.keyClick(window.chapter_search, Qt.Key.Key_Backspace)
+        self.assertIsNone(window.process)
+        window.chapter_search.setText("1000")
+        QTest.keyClick(window.chapter_search, Qt.Key.Key_Return)
+        self.assertEqual(window.chapter.currentData(), 1000)
+        window.chapter_boundaries.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("Первый блок · 第1000章 石门", window.run_summary.toPlainText())
+        self.assertIn("Последний блок · 春雨来了。", window.run_summary.toPlainText())
+        self.assertFalse(default_state_path(self.source).exists())
+
+        selections = []
+
+        def select_first():
+            picker = self.app.activeModalWidget()
+            picker.search.setText("雨")
+            picker.select_visible.click()
+            selections.append((picker.count.text(), picker.selection()))
+            picker.search.setText("石门")
+            picker.clear_visible.click()
+            selections.append((picker.count.text(), picker.selection()))
+            picker.select_visible.click()
+            selections.append((picker.count.text(), picker.selection()))
+            picker.list.setCurrentIndex(picker.model.index(0, 0))
+            QTest.keyClick(picker.list, Qt.Key.Key_Space)
+            selections.append((picker.count.text(), picker.selection()))
+            picker.search.setText("雨")
+            picker.clear_visible.click()
+            picker.search.setText("石门")
+            QTest.keyClick(picker.list, Qt.Key.Key_Space)
+            picker.accept()
+
+        QTimer.singleShot(0, select_first)
+        window.chapter_multiple.click()
+        hidden = tuple(range(2, 1000))
+        self.assertEqual(selections, [
+            ("Совпадений 998 · выбрано 999", (*hidden, 1000)),
+            ("Совпадений 2 · выбрано 998", hidden),
+            ("Совпадений 2 · выбрано 1000", (1, *hidden, 1000)),
+            ("Совпадений 2 · выбрано 999", (*hidden, 1000)),
+        ])
+        self.assertEqual(window.chapter.currentData(), (1, 1000))
+        window.run.click()
+        self._until(lambda: window.process is None)
+        output = default_output(self.source, "sample", chapter=(1, 1000))
+        self.assertEqual(window.last_output, output)
+        self.assertEqual(len(window.preview.pairs), 4)
+        self._close_window()
+        self._open_window()
+        self.window.restore_run.click()
+        self.assertEqual(self.window.chapter.currentData(), (1, 1000))
+        self.assertEqual(Path(self.window.output.text()), output)
+
+    def test_large_selections_are_passed_in_one_worker_file(self):
+        window = self.window
+        self.source.write_text("".join(f"第{i}章 雨{' 山路' if i <= 4000 else ''}{' 石门' if i % 2 else ''}\n"
+                                       f"第{i}段落。\n" for i in range(1, 8001)), encoding="utf-8")
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.load_chapters.click()
+        self._until(lambda: window.process is None)
+        self.assertEqual(len(window.chapter_entries), 8000)
+        for query, numbers in (("山路", range(1, 4001)), ("石门", range(1, 8000, 2))):
+            with self.subTest(last=numbers[-1]):
+                selected = tuple(numbers)
+
+                def select_matches():
+                    picker = self.app.activeModalWidget()
+                    picker.clear_visible.click()
+                    picker.search.setText(query)
+                    picker.select_visible.click()
+                    picker.accept()
+
+                QTimer.singleShot(0, select_matches)
+                window.chapter_multiple.click()
+                self.assertEqual(window.chapter.currentData(), selected)
+                window.chapter_boundaries.click()
+                self.assertIsNotNone(window.process, window.status.text())
+                args = window.process.arguments()
+                self.assertLess(len(subprocess.list2cmdline([sys.executable, *args]).encode("utf-16-le")) // 2, 2048)
+                self.assertNotIn("--chapter", args)
+                chapter_file = Path(next(arg.split("=", 1)[1] for arg in args if arg.startswith("--chapter-file=")))
+                self.assertEqual(chapter_file.parent, Path(window.job_config.name))
+                self.assertEqual(json.loads(chapter_file.read_text(encoding="utf-8")),
+                                 {"version": 1, "chapters": list(selected), "revision": window.chapter_revision})
+                self._until(lambda: window.process is None)
+                self.assertIsNone(window.job_config)
+                self.assertFalse(chapter_file.parent.exists())
+                self.assertIn("Выбрано глав: 4000", window.run_summary.toPlainText())
+                self.assertIn("Первый блок · 第1章 雨", window.run_summary.toPlainText())
+                self.assertIn(f"Последний блок · 第{numbers[-1]}段落。", window.run_summary.toPlainText())
+                self.assertFalse(default_state_path(self.source).exists())
+
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("выбрано глав: 4000", window.plan_summary.toPlainText().splitlines()[0])
+        self.assertIn("Последний блок · 第7999段落。", window.plan_summary.toPlainText())
+        self.assertFalse(default_state_path(self.source).exists())
+
+    def test_worker_rejects_a_chapter_file_after_source_changes_and_removes_job_directory(self):
+        window = self.window
+        original = "第一章 山路\n她走路。\n"
+        self.source.write_text(original, encoding="utf-8")
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.load_chapters.click()
+        self._until(lambda: window.process is None)
+        window.chapter.setCurrentIndex(window.chapter.findData(1))
+        build_arguments = window._arguments
+
+        def change_source_after_preflight(*args):
+            command = build_arguments(*args)
+            self.source.write_text("序言\n" + original, encoding="utf-8")
+            return command
+
+        with patch.object(window, "_arguments", side_effect=change_source_after_preflight):
+            window.run.click()
+        self.assertIsNotNone(window.process)
+        job_dir = Path(window.job_config.name)
+        self._until(lambda: window.process is None)
+        self.assertIn("Выбор главы устарел", window.status.text())
+        self.assertFalse(job_dir.exists())
+        self.assertFalse(default_state_path(self.source).exists())
+        self.assertFalse(default_output(self.source, "sample", chapter=1).exists())
+
+    def test_map_editor_can_mark_and_remove_boundary_and_load_result(self):
+        self.source.write_bytes("序言\r\nPart One\r\n春雨来了。\r\n\r\nPart Two\r\n她回家了。\r\n".encode("gb18030"))
+        window = self.window
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.encoding.setText("gb18030")
+        destination = self.directory / "book.chapters.json"
+
+        def edit():
+            editor = self.app.activeModalWidget()
+            editor.line.setValue(2)
+            editor.add.click()
+            editor.remove.click()
+            editor.line.setValue(4)
+            editor.add.click()
+            editor.accept()
+
+        with patch("ai_translator.desktop_panels.QInputDialog.getText", return_value=("Глава", True)), patch(
+            "ai_translator.desktop.QFileDialog.getSaveFileName", return_value=(str(destination), "")
+        ):
+            QTimer.singleShot(0, edit)
+            window.txt_map_editor.click()
+            self._until(lambda: window.process is None)
+        self.assertEqual(json.loads(destination.read_text(encoding="utf-8"))["anchors"], [{"line": 4, "title": "Глава"}])
+        window.chapter.setCurrentIndex(window.chapter.findData(2))
+        window.chapter_boundaries.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("她回家了。", window.run_summary.toPlainText())
+        self.assertNotIn("春雨来了。", window.run_summary.toPlainText())
+
+    def test_preview_changes_and_glossary_alias_keep_the_published_pair(self):
+        window = self.window
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        self.source.write_text("春雨来了。\n妙丽推开门。\n", encoding="utf-8")
+        glossary = self.directory / "terms.json"
+        glossary.write_text('{"赫敏":{"ru":"Гермиона","aliases":["妙丽"],"forms":["Гермионы"]}}',
+                            encoding="utf-8")
+        window.glossary.setText(str(glossary))
+        window.edit.setChecked(True)
+        window.review_edits.setChecked(True)
+        window.repair_review.setChecked(True)
+        window.run.click()
+        self._until(lambda: window.process is None)
+        preview = window.preview
+        self.assertIn("Совпадений: 2", preview.change_count.text())
+        preview.change_filter.setCurrentIndex(preview.change_filter.findData("repair"))
+        preview.next_change.click()
+        self.assertEqual(preview.position.value(), 2)
+        self.assertEqual(preview.terms(preview._current_pair()), [("赫敏", "妙丽")])
+        published = window.last_output.read_bytes()
+
+        observed = []
+
+        def check_context():
+            dialog = self.app.activeModalWidget()
+            try:
+                observed.extend((dialog.table.currentRow(), dialog.table.item(0, 3).text(), dialog.search.text(),
+                                 dialog.findChild(QPlainTextEdit).toPlainText()))
+            finally:
+                dialog.reject()
+
+        QTimer.singleShot(0, check_context)
+        preview.term.click()
+        self.assertEqual(observed[:3], [0, "Гермионы", "赫敏"])
+        self.assertIn("妙丽推开门。", observed[3])
+        self.assertIn("Гермионы", observed[3])
+        self.assertEqual(window.last_output.read_bytes(), published)
+        self.assertEqual(preview.original.toPlainText(), "妙丽推开门。")
+
+    def test_recent_runs_migrate_remain_bounded_and_distinguish_same_book_names(self):
+        window = self.window
+        old = window._remember_last_run("translate", self.source, default_output(self.source, "translate"),
+                                       window._profile_text())
+        window.preferences.remove("runHistory")
+        window._update_last_run()
+        self.assertTrue(window.preferences.contains("runHistory"))
+        folder = self.directory / "elsewhere"
+        folder.mkdir()
+        second = folder / self.source.name
+        second.write_text("她回家了。", encoding="utf-8")
+        window._remember_last_run("translate", second, default_output(second, "translate"), window._profile_text())
+        self.assertEqual([Path(record["source"]) for record in window._history()], [second, self.source])
+        window.source.setText(str(second))
+        window._restore_last_run(old)
+        self.assertEqual(Path(window.source.text()), self.source)
+        self.source.rename(self.directory / "renamed.txt")
+        window._restore_last_run(old)
+        self.assertIn("Исходный файл не найден", window.status.text())
+        result = default_output(second, "translate")
+        result.write_text("Книга", encoding="utf-8")
+        for number in range(22):
+            window._remember_last_run("translate", second, folder / f"{number}.txt", window._profile_text())
+        self.assertEqual(len(window._history()), 20)
+        window.forget_run.click()
+        self.assertEqual(window._history(), [])
+        self.assertEqual(result.read_text(encoding="utf-8"), "Книга")
+
+    def test_desktop_summary_reports_empty_output_and_paginates_published_findings(self):
+        window = self.window
+        self.source.write_text("Hello\n", encoding="utf-8")
+        window.budget.setValue(0)
+        window.run.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("Китайский текст не найден", window.status.text())
+        self.assertIn(str(window.last_output), window.run_summary.toPlainText())
+        self.assertIn("Запросов к модели: 0", window.run_summary.toPlainText())
+        self.source.write_text("她推开门。\n" * 102, encoding="utf-8")
+        window.budget.setValue(10)
+        window.edit.setChecked(True)
+        window.review_edits.setChecked(True)
+        window.repair_review.setChecked(True)
+        window.proofreading.setChecked(True)
+        with patch("ai_translator.desktop._confirm_replace", return_value=True):
+            window.run.click()
+            self._until(lambda: window.process is None)
+        report = window.review_summary
+        self.assertIs(window.results.currentWidget(), report)
+        self.assertIn("сверено частей 102 из 102", report.summary.text())
+        self.assertEqual(report.page.maximum(), 2)
+        self.assertEqual(len(report.rows.toPlainText().splitlines()), 100)
+        report.page.stepUp()
+        self.assertIn("1/102/1", report.rows.toPlainText())
+        self.assertEqual(len(report.rows.toPlainText().splitlines()), 2)
+        spool = report.items.file
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self._open_window()
+        self.assertTrue(spool.closed)
+
+    def test_switching_and_restoring_books_clears_review_spool_and_boundaries(self):
+        window = self.window
+        other = self.directory / "другая книга.txt"
+        other.write_text("他看见窗外的雨。\n", encoding="utf-8")
+        restored = window._remember_last_run("translate", other, default_output(other, "translate"),
+                                             window._profile_text())
+        self.source.write_text("她推开门。\n" * 102, encoding="utf-8")
+        window.edit.setChecked(True)
+        window.review_edits.setChecked(True)
+        window.proofreading.setChecked(True)
+        window.run.click()
+        self._until(lambda: window.process is None)
+        report = window.review_summary
+        self.assertIs(window.results.currentWidget(), report)
+        report.page.setValue(2)
+        self.assertEqual(report.page.value(), 2)
+        self.assertIn("1/102/1", report.rows.toPlainText())
+        self.assertIn("她推开门。", report.rows.toPlainText())
+        spool = report.items.file
+        self.assertFalse(spool.closed)
+        self.assertIn(str(window.last_output), window.run_summary.toPlainText())
+
+        window.source.setText(str(other))
+        self.assertTrue(spool.closed)
+        self.assertIsNone(report.items)
+        self.assertEqual(report.rows.toPlainText(), "")
+        self.assertEqual((report.page.value(), report.page.maximum()), (1, 1))
+        self.assertFalse(report.page.isEnabled())
+        self.assertNotIn(str(self.source), report.summary.text())
+        self.assertEqual(window.run_summary.toPlainText(), "")
+
+        window.source.setText(str(self.source))
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.chapter_boundaries.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("她推开门。", window.run_summary.toPlainText())
+        window._restore_last_run(restored)
+        self.assertEqual(window.source.text(), str(other))
+        self.assertEqual(window.run_summary.toPlainText(), "")
+        self.assertEqual(report.rows.toPlainText(), "")
+
+    def test_worker_for_previous_source_cannot_publish_results_after_switch(self):
+        window = self.window
+        other = self.directory / "другая книга.txt"
+        other.write_text("他看见窗外的雨。\n", encoding="utf-8")
+        window.edit.setChecked(True)
+        window.review_edits.setChecked(True)
+        window.proofreading.setChecked(True)
+        read_events = window._read_events
+        staged = []
+
+        def switch_after_findings_arrive():
+            read_events()
+            if window.pending_review is not None:
+                staged.append(window.pending_review.file)
+                window.source.setText(str(other))
+                window.cancel()
+
+        with patch.object(window, "_read_events", side_effect=switch_after_findings_arrive):
+            window.run.click()
+            self.assertIsNotNone(window.process, window.status.text())
+            self._until(lambda: window.process is None)
+        self.assertEqual(len(staged), 1, window.log.toPlainText())
+        self.assertTrue(staged[0].closed)
+        self.assertTrue(default_output(self.source, "translate").is_file(), window.log.toPlainText())
+        self.assertIsNone(window.review_summary.items)
+        self.assertIsNone(window.pending_review)
+        self.assertEqual(window.review_summary.rows.toPlainText(), "")
+        self.assertEqual(window.run_summary.toPlainText(), "")
+        self.assertFalse(window.open_result.isEnabled())
+        self.assertFalse(window.budget_status.isVisible())
+        self.assertEqual(window.status.text(), "Выберите действие для текущей книги.")
+
+        window.source.setText(str(self.source))
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.chapter_boundaries.click()
+        self.assertIsNotNone(window.process)
+        window.source.setText(str(other))
+        window.source.setText(str(self.source))
+        self._until(lambda: window.process is None)
+        self.assertIn("她轻轻地推开门。", window.log.toPlainText())
+        self.assertEqual(window.run_summary.toPlainText(), "")
 
     def test_launcher_opens_the_book_named_on_the_command_line(self):
         book = "-книга с пробелами.epub"
@@ -926,6 +1321,28 @@ with open_state(Path(sys.argv[1])) as db:
         self.assertIn("Остановлено", self.window.status.text())
         self.assertFalse(self.source.with_name(self.source.stem + ".ru.txt").exists())
         self._until(lambda: not _process_is_live(pid))
+
+        self.source.write_text("第一章 门外\n她推开门。\n第二章 台阶\n她下楼。\n第三章 等待\n她站住。\n",
+                               encoding="utf-8")
+        pid_file.unlink()
+        window = self.window
+        window.operation.setCurrentIndex(window.operation.findData("sample"))
+        window.load_chapters.click()
+        self._until(lambda: window.process is None)
+        window._filter_chapters(selected=(1, 3))
+        window._update_form()
+        window.run.click()
+        self._until(lambda: pid_file.is_file() and bool(pid_file.read_text()))
+        pid = int(pid_file.read_text())
+        window.stop.click()
+        self._until(lambda: window.process is None)
+        self._until(lambda: not _process_is_live(pid))
+        self.assertFalse(default_output(self.source, "sample", chapter=(1, 3)).exists())
+        with open_state(default_state_path(self.source)) as state:
+            self.assertEqual(read_request_budget(state), (3, None))
+        window.inspect.click()
+        self._until(lambda: window.process is None)
+        self.assertIn("ответов из кеша: 1", window.plan_summary.toPlainText())
 
     @skipIf(os.name != "posix", "Тест группы процессов POSIX")
     def test_killing_desktop_worker_stops_provider_in_its_private_group(self):
