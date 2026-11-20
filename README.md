@@ -1,21 +1,109 @@
 # AI Translator
 
-## What this project about
+Литературный перевод книг и фанфиков с китайского на русский. Переводчик может перестраивать предложения, диалоги и идиомы ради естественной русской прозы. Глоссарий задаёт привычные формы имён и терминов, а отдельный этап редактуры позволяет сверить черновик с оригиналом.
 
-This is AI Translator that translates text from Chinese to Russian. This project is made by hand with minimal use of AI tools for learning purposes. The first version of the translator will translate text from Chinese to Russian using OpenAI API key. The project will take input and give output in .txt format, however, in the future, it is planned to support other formats and user's OpenAI subscription instead of API key.
+## Быстрый старт
 
-## Plans
+Нужны Python 3.11 или новее, uv и актуальный Codex CLI. Для подписочного режима войдите в Codex через ChatGPT. Перевод использует лимиты Codex вашего плана. [Установка uv](https://docs.astral.sh/uv/) · [Установка Codex CLI](https://developers.openai.com/codex/cli) · [Вход и лимиты Codex](https://developers.openai.com/codex/auth)
 
-### To Do List
+```bash
+uv sync --locked
+codex login status     # Если вход ещё не выполнен, запустите codex login.
+uv run ai-translator translate "книга.epub"
+```
 
-- [ ] Implement the basic translation of .txt files
-- [ ] Implement the prompting for giving clues about context
-- [ ] Implement glossary support for better translation (automatically created glossary with names)
-- [ ] Implement support for user's OpenAI subscription
-- [ ] Implement support for other file formats for input and output (e.g., .docx, .fb2, .epub, .webp)
-- [ ] Implement multi-threaded translation for faster processing of large files
-- [ ] Implement a user-friendly interface for easier usage
+Готовый файл появится рядом с исходным под именем `книга.ru.epub`. Флаг `--edit` включает отдельную редактуру, а `-o` задаёт путь результата.
 
-### Implementation Details
+```bash
+uv run ai-translator translate "книга.fb2" --edit -o "перевод.fb2"
+```
 
-At first, the .txt file with Chinese text will be read. Chinese text will be divided into equal parts using tiktoken and langchain-text-splitters packages, those part then will be sent to the OpenAI model for getting individual glossary in json format for each part that will be stored in a SQLite database. After all parts are processed, all version of glossary will be merged into one final glossary that will be used for the final translation of the whole text. The translation also will be done in parts, with each part being translated in a distinct thread with the help of the glossary and a global prompt. Results of the fished translations will be stored in SQLite until all parts are translated. The final translation will be saved in a .txt file.
+TXT, FB2 и EPUB сохраняются в исходном формате. Для TXT распознаются UTF-8, UTF-16 и UTF-32 с BOM, затем GB18030. При необходимости задайте `--encoding` явно. Выходной TXT записывается в UTF-8. FB2 сохраняет структуру, сноски и вложенные изображения. EPUB сохраняет порядок чтения, ссылки, оформление и ресурсы. В EPUB переводится китайский текст в XHTML, оглавлении, заголовках и текстовых элементах страниц SVG. Для нестандартного раздела используется указанный в книге запасной XHTML или SVG. Текст внутри растровых изображений и защищённые DRM-книги не поддерживаются.
+
+## Глоссарий для фанфиков
+
+Подготовьте UTF-8 JSON со своими соответствиями. Можно указать несколько китайских написаний одного имени.
+
+```json
+{
+  "哈利": "Гарри",
+  "哈利·波特": "Гарри Поттер",
+  "赫敏": "Гермиона",
+  "霍格沃茨": "Хогвартс"
+}
+```
+
+Передайте этот файл как `--glossary canon.json`. При автоматическом сборе введённые формы сохраняются в итоговом словаре и передаются модели при каждом совпадении. Модель склоняет имена по правилам русского языка. Новые варианты стоит просмотреть, особенно если у произведения несколько русских локализаций.
+
+```bash
+# Предложить недостающие имена и термины.
+uv run ai-translator glossary "книга.epub" --glossary canon.json -o review.json
+
+# Внести правки в review.json и использовать готовый словарь.
+uv run ai-translator translate "книга.epub" --glossary review.json --no-auto-glossary --edit
+```
+
+При обычном переводе глоссарий автоматически собирается перед переводом. Чтобы сохранить его, укажите `--save-glossary review.json`.
+
+## Модели и стиль
+
+Сохраните параметры в `translation.toml` и добавьте `--config translation.toml` к нужной команде. Модель и reasoning задаются независимо для каждого этапа. Имена должны быть доступны выбранному провайдеру и вашей учётной записи. Значение `reasoning = ""` оставляет настройку провайдеру.
+
+```toml
+fandom = "Гарри Поттер"
+style = "Естественная русская проза. Голоса героев различимы. Используй ё."
+batch_chars = 2400
+timeout = 300
+
+[glossary]
+model = "gpt-6.2-sol"
+reasoning = "low"
+
+[translate]
+model = "gpt-6.2-sol"
+reasoning = "low"
+
+[edit]
+model = "gpt-6.2-sol"
+reasoning = "medium"
+```
+
+Команда `sample` сохраняет двуязычную пробу в TXT. По умолчанию она переводит первый пакет, а `--batches` позволяет взять больше. Запустите её с двумя конфигурациями и разными выходными путями, чтобы сравнить стиль до перевода всей книги.
+
+```bash
+uv run ai-translator sample "книга.epub" --config translation.toml --batches 2 \
+  --glossary canon.json --no-auto-glossary --edit -o "проба.txt"
+```
+
+С готовым глоссарием и `--no-auto-glossary` полный прогон переиспользует ответы из пробы при тех же настройках. Автоматический глоссарий пробы охватывает только выбранные пакеты. Его можно сохранить через `--save-glossary`. При полном сборе состав словаря и разбиение могут измениться.
+
+`inspect` показывает число блоков, пакетов и плановых запросов без обращения к модели. Короткие разделы могут обрабатываться в одном пакете. По умолчанию на пакет приходится один запрос на сбор глоссария и один на перевод. `--no-auto-glossary` убирает первый запрос, `--edit` добавляет запрос на редактуру. Если ответ нарушил разметку или пропустил блок, переводчик один раз запрашивает исправление.
+
+```bash
+uv run ai-translator inspect "книга.epub" --config translation.toml --edit
+uv run ai-translator translate "книга.epub" --config translation.toml --edit --max-calls 20
+```
+
+`--max-calls` ограничивает число новых запросов за запуск, включая запросы на исправление. При лимите в один запрос исправление будет отправлено на следующем запуске. Статистика токенов появляется, если провайдер вернул её. Готовые ответы сохраняются в скрытой базе SQLite рядом с исходником. После остановки по лимиту или ошибке подключения повторите исходную команду. Меняя только модель редактора, можно переиспользовать черновик. Передавайте `--state путь.sqlite3`, если нужно хранить базу отдельно. Для замены уже существующего результата укажите `--force`.
+
+## Claude Pro
+
+Установите актуальный Claude Code и выполните `claude auth login`, выбрав вход через Claude.ai. Переводчик вызывает установленный CLI в режиме `claude -p` с локальным входом и структурированным выводом. По умолчанию для глоссария используется Haiku, для перевода и редактуры — Sonnet. Имена моделей и `reasoning` передаются как `--model` и `--effort`. [CLI Claude Code](https://code.claude.com/docs/en/cli-reference) · [Использование лимитов подписки](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+
+```bash
+uv run ai-translator sample "книга.epub" --provider claude-code --edit --max-calls 3
+```
+
+## Опциональный доступ по ключу
+
+Провайдер `openai-api` использует Responses API и переменную окружения `OPENAI_API_KEY`. В этом режиме применяется оплата API. Провайдер по умолчанию выбирается через `provider = "openai-api"` в TOML или флагом команды. [Каталог моделей OpenAI API](https://developers.openai.com/api/docs/models)
+
+```bash
+uv run ai-translator translate "книга.txt" --provider openai-api
+```
+
+## Проверки
+
+```bash
+uv run --locked python -m unittest discover -s tests -v
+```

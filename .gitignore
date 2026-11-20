@@ -12,3 +12,6 @@ wheels/
 # Other files
 .env
 example_chinese_text.txt
+
+# Local translation cache
+*.ai-translator.sqlite3*
