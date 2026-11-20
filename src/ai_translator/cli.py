@@ -4,7 +4,6 @@ import re
 import sqlite3
 import sys
 import zipfile
-from contextlib import closing
 from pathlib import Path
 
 from lxml import etree
@@ -15,7 +14,7 @@ from .formats import chapter_revision, read_book
 from .paths import default_output
 from .pipeline import (
     BudgetExceeded, CacheMiss, Requests, batches, default_state_path, expand_glossary, extract, load_glossary, open_state,
-    read_request_budget, state_for_reading, translate,
+    open_state_readonly, read_request_budget, state_for_reading, translate,
 )
 from .provider import AuthenticationError, ProviderError
 from .publication import check_publication, output_path, recover_outputs, validate_job_paths, write_outputs
@@ -226,7 +225,7 @@ def _run(args: argparse.Namespace) -> None:
         request_budget = None
         first_missing = ("glossary" if glossary_calls else "translate") if groups else None
         if state.is_file():
-            with closing(sqlite3.connect(state.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            with open_state_readonly(state) as db:
                 db.execute("BEGIN")
                 table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'").fetchone()
                 cached_count = db.execute("SELECT COUNT(*) FROM responses").fetchone()[0] if table else 0

@@ -131,7 +131,7 @@ class TranslatorTests(TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             status = cli(list(map(str, args)))
-        self.assertEqual(status, expected, stderr.getvalue())
+        self.assertEqual(status, expected, stderr.getvalue() or stdout.getvalue())
         return stdout.getvalue(), stderr.getvalue()
 
     def test_entry_points_emit_utf8_even_when_the_pipe_encoding_is_cp1252(self):

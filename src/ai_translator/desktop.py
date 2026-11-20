@@ -8,7 +8,6 @@ import os
 import signal
 import sqlite3
 import sys
-from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,7 +15,10 @@ from .config import STAGES, ModelSettingError, Settings, load_config, parse_conf
 from .console import configure_output
 from .formats import chapter_revision
 from .paths import default_output
-from .pipeline import SamplePair, default_state_path, load_glossary, parse_glossary, read_request_budget, state_for_reading
+from .pipeline import (
+    SamplePair, default_state_path, load_glossary, open_state_readonly, parse_glossary, read_request_budget,
+    state_for_reading,
+)
 from .publication import validate_job_paths, write_outputs
 from .windows_job import taskkill_command
 
@@ -1252,7 +1254,7 @@ class Window(QMainWindow):
             path = state_for_reading(path)
             if not path.is_file():
                 return None
-            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+            with open_state_readonly(path, timeout=0.2) as db:
                 budget = read_request_budget(db)
         except (sqlite3.Error, OSError) as exc:
             self.log.appendPlainText(f"Не удалось прочитать общий лимит. {exc}")

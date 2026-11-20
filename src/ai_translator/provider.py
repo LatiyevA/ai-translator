@@ -8,6 +8,7 @@ import signal
 import socket
 import subprocess
 import tomllib
+from contextlib import closing
 from http.client import HTTPConnection, HTTPException, HTTPSConnection, IncompleteRead
 from io import StringIO
 from pathlib import Path
@@ -201,7 +202,7 @@ def _cli_exited(process: subprocess.Popen, *, own_group: bool) -> bool:
     if own_group and hasattr(select, "kqueue"):
         event = select.kevent(process.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
                               fflags=select.KQ_NOTE_EXIT)
-        with select.kqueue() as queue:
+        with closing(select.kqueue()) as queue:
             try:
                 notices = queue.control([event], 1, 0)
             except ProcessLookupError:

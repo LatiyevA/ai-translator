@@ -288,6 +288,18 @@ def state_for_reading(path: Path) -> Path:
     return _unmigrated_state(path) or path
 
 
+def open_state_readonly(path: Path, *, timeout: float = 5):
+    path = path.resolve()
+    uri = path.as_uri() + "?mode=ro"
+    if path_too_long(path.with_name(path.name + "-journal")):
+        # An oversized legacy cache cannot have a rollback journal. Windows SQLite
+        # treats probing that filename as an I/O error, even when reading the cache.
+        wal = path.with_name(path.name + "-wal")
+        if path_too_long(wal) or not wal.exists():
+            uri += "&immutable=1"
+    return closing(sqlite3.connect(uri, uri=True, timeout=timeout))
+
+
 class Requests:
     def __init__(
         self, connection: sqlite3.Connection, settings: Settings, max_calls: int | None = None,
@@ -871,7 +883,7 @@ def _copy_legacy_state(legacy: Path, path: Path) -> None:
         with NamedTemporaryFile(dir=path.parent, prefix=".state-", delete=False) as stream:
             temporary = Path(stream.name)
         try:
-            with closing(sqlite3.connect(legacy.as_uri() + "?mode=ro", uri=True)) as old:
+            with open_state_readonly(legacy) as old:
                 with closing(sqlite3.connect(temporary)) as new:
                     old.backup(new)
             if not path.exists():
